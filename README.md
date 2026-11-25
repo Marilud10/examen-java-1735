@@ -127,3 +127,14 @@ mvn clean verify
 Para ejecutar también las pruebas JDBC, configura `CARMOTORS_TEST_DB_URL` con la URL del servidor (por ejemplo, `jdbc:mysql://localhost:3306/`), `CARMOTORS_TEST_DB_USER` y `CARMOTORS_TEST_DB_PASSWORD`. Las pruebas crean esquemas aleatorios desechables y eliminan los que crearon. Sin URL de prueba, las pruebas JDBC se marcan como omitidas. Los informes de JUnit quedan en `target/surefire-reports` y GitHub Actions los adjunta a su ejecución con MySQL 8.0.
 
 Consulta el [contrato de consola y la lista de incorporación de vistas](docs/navegacion-consola.md) y el [informe de integración](docs/integracion-final.md).
+
+
+
+### Control de Concurrencia en la Reserva de Repuestos (Punto H)
+
+* **Problema identificado (Condición de carrera):** Cuando dos o más técnicos intentaban reservar simultáneamente la última unidad disponible de un repuesto desde distintas órdenes de servicio, las operaciones de consulta de stock, validación de disponibilidad y actualización/reserva se intercalaban entre hilos. Esto permitía que ambos hilos leyeran el mismo stock inicial (`1`), validaran la disponibilidad y completaran la reserva de una pieza única.
+* **Solución implementada:**
+  * Se protegió la sección crítica de reserva en `ServicioService.reservarRepuesto(...)` mediante un bloque `synchronized` sobre un objeto monitor dedicado (`CERROJO_RESERVA`), garantizando exclusión mutua para que solo un hilo ejecute el ciclo completo de lectura, validación y actualización en base de datos a la vez.
+  * Se creó la clase ejecutable independiente `SimulacionReservaConcurrenteRepuestos`, la cual prepara un repuesto con stock inicial `1` y lanza hilos concurrentes (`Thread`) sincronizados con `CountDownLatch` para demostrar que únicamente el primer hilo completa la reserva y el segundo es rechazado por falta de stock.
+
+  marilud

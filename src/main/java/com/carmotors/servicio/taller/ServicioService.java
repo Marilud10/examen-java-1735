@@ -14,9 +14,16 @@ import com.carmotors.servicio.taller.integracion.InventarioServiciosPort;
 import com.carmotors.servicio.taller.integracion.ReservaRepuesto;
 import com.carmotors.servicios.inventario.InventarioServiciosJdbc;
 
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -25,10 +32,15 @@ import java.util.Optional;
 import java.util.function.Consumer;
 
 public final class ServicioService {
+    private static final DateTimeFormatter FORMATO_REPORTE =
+            DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm");
+    private static final Object CERROJO_RESERVA = new Object();
+
     private final ServicioDAO servicios;
     private final TecnicoDAO tecnicos;
     private final FuenteConexion fuente;
     private final ConsultaOrdenServicio<IdentificadorServicio, Servicio> consulta;
+    private final List<ObservadorNotificacionCliente> observadores = new ArrayList<>();
 
     public ServicioService() {
         this(new ServicioDAO(), new TecnicoDAO());
@@ -104,21 +116,25 @@ public final class ServicioService {
     public void actualizarEstado(int id, int estadoId) throws SQLException {
         IdentificadorServicio servicioId = new IdentificadorServicio(id);
         validarId(estadoId, "estado");
-        enTransaccion((conexion, inventario) -> {
+        String destino = enTransaccion((conexion, inventario) -> {
             bloquearOrden(conexion, servicioId);
-            String destino = nombreEstado(conexion, estadoId);
-            // Al cancelar o completar, lo reservado que no se usó vuelve al stock;
-            // lo ya usado no cambia (la factura cobra solo lo usado).
-            if (cancelado(destino) || completado(destino)) {
+            String nombreDestino = nombreEstado(conexion, estadoId);
+            if (cancelado(nombreDestino)) {
                 inventario.liberarTodo(id);
             }
             servicios.actualizarEstado(conexion, servicioId, estadoId);
-            return null;
+            return nombreDestino;
         });
+        buscarPorId(id).ifPresent(ordenActualizada ->
+                notificarObservadores(ordenActualizada, "CAMBIO_ESTADO",
+                        "Nuevo estado: " + destino + " (ID " + estadoId + ")"));
     }
 
+    // --- OPERACIÓN COMPARTIDA Y SINCRONIZADA PARA RESERVA DE REPUESTOS ---
     public void reservarRepuesto(ReservaRepuesto solicitud) throws SQLException {
-        moverRepuesto(solicitud.servicioId(), false, inventario -> inventario.reservar(solicitud));
+        synchronized (CERROJO_RESERVA) {
+            moverRepuesto(solicitud.servicioId(), false, inventario -> inventario.reservar(solicitud));
+        }
     }
 
     public void consumirRepuesto(ConsumoRepuesto solicitud) throws SQLException {
@@ -157,10 +173,6 @@ public final class ServicioService {
         return "Cancelado".equalsIgnoreCase(estado.strip()) || "Cancelada".equalsIgnoreCase(estado.strip());
     }
 
-    private static boolean completado(String estado) {
-        return "Completado".equalsIgnoreCase(estado.strip()) || "Completada".equalsIgnoreCase(estado.strip());
-    }
-
     private static void validarOrdenOperativa(String estado) {
         if (cancelado(estado)) {
             throw new IllegalStateException("La orden está cancelada");
@@ -196,6 +208,11 @@ public final class ServicioService {
         if (!servicios.actualizarFechaEntrega(new IdentificadorServicio(id), fechaEntrega)) {
             throw servicioInexistente(id);
         }
+        buscarPorId(id).ifPresent(ordenActualizada ->
+                notificarObservadores(ordenActualizada, "ACTUALIZACION_ENTREGA",
+                        fechaEntrega == null
+                                ? "Fecha de entrega removida"
+                                : "Fecha de entrega actualizada a " + fechaEntrega.format(FORMATO_REPORTE)));
     }
 
     public int registrarTecnico(Tecnico solicitud) throws SQLException {
@@ -258,5 +275,78 @@ public final class ServicioService {
 
     private static NoSuchElementException servicioInexistente(int id) {
         return new NoSuchElementException("No existe el servicio " + id);
+    }
+
+    public List<Servicio> listarServiciosCompletados() throws SQLException {
+        return List.copyOf(servicios.listarCompletados());
+    }
+
+    public List<Servicio> listarPorRangoEntrega(LocalDateTime desde, LocalDateTime hasta) throws SQLException {
+        if (desde != null && hasta != null && hasta.isBefore(desde)) {
+            throw new IllegalArgumentException("La fecha final no puede ser anterior a la fecha inicial");
+        }
+        return List.copyOf(servicios.listar(desde, hasta));
+    }
+
+    public Path exportarReporteServiciosCompletadosTxt(Path rutaArchivo) throws SQLException, IOException {
+        Objects.requireNonNull(rutaArchivo, "La ruta del archivo es obligatoria");
+        List<Servicio> completados = listarServiciosCompletados();
+        Path destino = rutaArchivo.toString().toLowerCase().endsWith(".txt")
+                ? rutaArchivo
+                : Path.of(rutaArchivo.toString() + ".txt");
+        Path padre = destino.toAbsolutePath().getParent();
+        if (padre != null) {
+            Files.createDirectories(padre);
+        }
+        try (BufferedWriter escritor = Files.newBufferedWriter(destino, StandardCharsets.UTF_8)) {
+            escritor.write("==========================================================");
+            escritor.newLine();
+            escritor.write("CARMOTORS - REPORTE DETALLADO DE SERVICIOS COMPLETADOS");
+            escritor.newLine();
+            escritor.write("Generado: " + LocalDateTime.now().format(FORMATO_REPORTE));
+            escritor.newLine();
+            escritor.write("==========================================================");
+            escritor.newLine();
+            if (completados.isEmpty()) {
+                escritor.write("No hay servicios completados registrados.");
+                escritor.newLine();
+            } else {
+                for (Servicio orden : completados) {
+                    escritor.write(String.format(
+                            "Servicio #%d | Vehículo ID: %d | Tipo Mant.: %d | Estado ID: %d%n"
+                                    + "  Fecha recepción: %s%n"
+                                    + "  Fecha entrega:   %s%n"
+                                    + "  Mano de obra:    %s%n"
+                                    + "  Descripción:     %s%n"
+                                    + "----------------------------------------------------------%n",
+                            orden.id(),
+                            orden.vehiculoId(),
+                            orden.mantenimientoTipoId(),
+                            orden.estadoId(),
+                            orden.fechaRecepcion() == null ? "sin fecha" : orden.fechaRecepcion().format(FORMATO_REPORTE),
+                            orden.fechaEntrega() == null ? "sin fecha" : orden.fechaEntrega().format(FORMATO_REPORTE),
+                            orden.costoManoObra() == null ? "sin registrar" : orden.costoManoObra().toPlainString(),
+                            orden.descripcionProblema()
+                    ));
+                }
+            }
+            escritor.write("Total servicios completados: " + completados.size());
+            escritor.newLine();
+        }
+        return destino;
+    }
+
+    public void registrarObservador(ObservadorNotificacionCliente observador) {
+        observadores.add(Objects.requireNonNull(observador, "El observador no puede ser nulo"));
+    }
+
+    public boolean eliminarObservador(ObservadorNotificacionCliente observador) {
+        return observadores.remove(observador);
+    }
+
+    private void notificarObservadores(Servicio orden, String evento, String detalle) {
+        for (ObservadorNotificacionCliente observador : List.copyOf(observadores)) {
+            observador.alActualizarServicio(orden, evento, detalle);
+        }
     }
 }
